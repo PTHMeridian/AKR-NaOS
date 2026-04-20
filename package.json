@@ -1,0 +1,25 @@
+{
+  "name": "akr-naos",
+  "version": "1.0.0",
+  "description": "AKR Naos - Nested Authentication Operations Suite by SA AT Cryptographics",
+  "main": "dist/index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PTHMeridian/AKR-NaOS.git"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "tsx src/index.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "secrets.js-grempe": "^2.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}
