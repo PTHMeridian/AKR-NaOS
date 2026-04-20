@@ -3,173 +3,271 @@ import { VaultModule } from "./phase2-vault/index";
 import { PKIModule } from "./phase3-pki/index";
 import { SecureChannelModule } from "./phase4-channel/index";
 import { AuditModule } from "./phase5-audit/index";
+import { IdentityWallet } from "./phase6-wallet/index";
 import { randomBytes } from "crypto";
 
 async function main() {
   console.log("AKR Naos - Nested Authentication Operations Suite");
-  console.log("SA AT Cryptographics\n");
+  console.log("SA AT Cryptographics");
+  console.log("=".repeat(60) + "\n");
 
   const audit = new AuditModule();
-  audit.record("SYSTEM_START", "AKR-NAOS", "INFO", { version: "1.0.0" }, "SYSTEM");
+  audit.record("SYSTEM_START", "AKR-NAOS", "INFO", { version: "1.0.0", phases: 6 }, "SYSTEM");
 
   // PHASE 1
   console.log("=== Phase 1 - Shamir Secret Sharing ===");
   const shamir = new ShamirModule();
-  const privateKey = "simulated-ml-kem-768-private-key-material-for-testing";
-  const splitResult = shamir.split(privateKey, { threshold: 3, totalShares: 5, label: "AKR-primary-key" });
-  audit.record("SECRET_SPLIT", "AKR-primary-key", "INFO", { threshold: 3, totalShares: 5 }, "alice");
-  const selectedShares = [splitResult.shares[0], splitResult.shares[2], splitResult.shares[4]];
-  const recoverResult = shamir.recover(selectedShares, splitResult.secretHash);
-  audit.record("SECRET_RECOVERED", "AKR-primary-key", "INFO", { verified: recoverResult.verified }, "alice");
-  console.log("Split: " + splitResult.totalShares + " shares | Recovered: " + (recoverResult.secret === privateKey));
+  const secret = "simulated-ml-kem-768-private-key-material-for-testing";
+  const split = shamir.split(secret, { threshold: 3, totalShares: 5, label: "primary-key" });
+  audit.record("SECRET_SPLIT", "primary-key", "INFO", { threshold: 3, totalShares: 5 }, "alice");
+  const recovered = shamir.recover([split.shares[0], split.shares[2], split.shares[4]], split.secretHash);
+  audit.record("SECRET_RECOVERED", "primary-key", "INFO", { verified: recovered.verified }, "alice");
+  console.log("Split: " + split.totalShares + " shares, threshold " + split.threshold + " | Recovered: " + (recovered.secret === secret) + " | Verified: " + recovered.verified);
   console.log("=== Phase 1 Complete ===\n");
 
   // PHASE 2
   console.log("=== Phase 2 - Key Vault ===");
   const vault = new VaultModule();
   const password = "sa-at-vault-master-password-2026";
-  const quantumKey = new Uint8Array(randomBytes(2400));
-  const storeResult = vault.store(quantumKey, password, {
-    label: "quantum-primary", algorithm: "ML-KEM-768", mode: "quantum", expiryDays: 90, metadata: { owner: "PTH-Meridian" },
-  });
-  audit.record("KEY_STORED", storeResult.id, "INFO", { label: storeResult.label, algorithm: "ML-KEM-768" }, "alice");
-  const retrieveResult = vault.retrieve(storeResult.id, password);
-  audit.record("KEY_RETRIEVED", storeResult.id, "INFO", { label: retrieveResult.label }, "alice");
-  console.log("Stored: " + storeResult.label + " | Match: " + (Buffer.from(retrieveResult.privateKey).toString("hex") === Buffer.from(quantumKey).toString("hex")));
+  const signingKey = new Uint8Array(randomBytes(32));
+  const encryptKey = new Uint8Array(randomBytes(2400));
+  const sigStore = vault.store(signingKey, password, { label: "alice-signing", algorithm: "ML-DSA-65", mode: "quantum", expiryDays: 365, metadata: { owner: "alice" } });
+  const encStore = vault.store(encryptKey, password, { label: "alice-encryption", algorithm: "ML-KEM-768", mode: "quantum", expiryDays: 365, metadata: { owner: "alice" } });
+  audit.record("KEY_STORED", sigStore.id, "INFO", { label: "alice-signing" }, "alice");
+  audit.record("KEY_STORED", encStore.id, "INFO", { label: "alice-encryption" }, "alice");
+  console.log("Signing key:    " + sigStore.id);
+  console.log("Encryption key: " + encStore.id);
   console.log("=== Phase 2 Complete ===\n");
 
   // PHASE 3
   console.log("=== Phase 3 - Certificate Authority ===");
   const pki = new PKIModule();
-  const rootCA = pki.createRootCA(
-    { commonName: "PTH Meridian Root CA", organization: "PTH Meridian", country: "CA" },
-    new Uint8Array(randomBytes(1952)), 3650
-  );
-  audit.record("CERT_ISSUED", rootCA.id, "INFO", { type: "ROOT_CA", subject: rootCA.subject }, "PKI-ENGINE");
-  const intCA = pki.issueIntermediateCA(
-    { commonName: "PTH Meridian Intermediate CA", organization: "PTH Meridian" },
-    new Uint8Array(randomBytes(1952)), 1825
-  );
-  audit.record("CERT_ISSUED", intCA.id, "INFO", { type: "INTERMEDIATE_CA" }, "PKI-ENGINE");
-  const aliceCert = pki.issueCertificate(
-    { commonName: "alice@pth-meridian.io", organization: "PTH Meridian" },
-    new Uint8Array(randomBytes(1952)), intCA.id, 365
-  );
+  const rootCA = pki.createRootCA({ commonName: "PTH Meridian Root CA", organization: "PTH Meridian", country: "CA" }, new Uint8Array(randomBytes(1952)), 3650);
+  const intCA = pki.issueIntermediateCA({ commonName: "PTH Meridian Intermediate CA", organization: "PTH Meridian" }, new Uint8Array(randomBytes(1952)), 1825);
+  const aliceCert = pki.issueCertificate({ commonName: "alice@pth-meridian.io", organization: "PTH Meridian", email: "alice@pth-meridian.io" }, new Uint8Array(randomBytes(1952)), intCA.id, 365);
+  const serverCert = pki.issueCertificate({ commonName: "api.akr-naos.io", organization: "PTH Meridian" }, new Uint8Array(randomBytes(1952)), intCA.id, 90);
   audit.record("CERT_ISSUED", aliceCert.id, "INFO", { subject: aliceCert.subject }, "PKI-ENGINE");
-  const serverCert = pki.issueCertificate(
-    { commonName: "api.akr-naos.io", organization: "PTH Meridian" },
-    new Uint8Array(randomBytes(1952)), intCA.id, 90
-  );
   audit.record("CERT_ISSUED", serverCert.id, "INFO", { subject: serverCert.subject }, "PKI-ENGINE");
-  const bobCert = pki.issueCertificate(
-    { commonName: "bob@pth-meridian.io", organization: "PTH Meridian" },
-    new Uint8Array(randomBytes(1952)), intCA.id, 365
-  );
-  pki.revoke(bobCert.id, "key compromise");
-  audit.record("CERT_REVOKED", bobCert.id, "ALERT", { reason: "key compromise" }, "PKI-ENGINE");
-  console.log("Root CA + Int CA + 3 end-entity certs issued | Bob revoked");
+  console.log("Alice cert: " + aliceCert.id + " | Valid: " + pki.verify(aliceCert.id).valid);
   console.log("=== Phase 3 Complete ===\n");
 
   // PHASE 4
   console.log("=== Phase 4 - Secure Channel ===");
   const channel = new SecureChannelModule();
-  const clientHello = channel.initiateHandshake();
-  const serverHello = channel.respondToHandshake(clientHello, serverCert.id);
+  const hello = channel.initiateHandshake();
+  const response = channel.respondToHandshake(hello, serverCert.id);
   const sharedSecret = new Uint8Array(randomBytes(32));
-  const session = channel.establishSession(
-    clientHello.sessionId, sharedSecret,
-    clientHello.nonce, serverHello.nonce,
-    serverHello.chosenAlgorithm, 60
-  );
+  const session = channel.establishSession(hello.sessionId, sharedSecret, hello.nonce, response.nonce, response.chosenAlgorithm, 60);
   audit.record("SESSION_ESTABLISHED", session.sessionId, "INFO", { algorithm: session.algorithm }, "alice");
-  const msg1 = channel.encrypt(session.sessionId, "PTH Meridian - Ask. Solve. Done.");
-  audit.record("MESSAGE_ENCRYPTED", session.sessionId, "INFO", { sequence: msg1.sequence, bytes: msg1.ciphertext.length }, "alice");
-  const dec1 = channel.decrypt(msg1);
-  audit.record("MESSAGE_DECRYPTED", session.sessionId, "INFO", { sequence: msg1.sequence, match: dec1 === "PTH Meridian - Ask. Solve. Done." }, "alice");
-  channel.terminateSession(session.sessionId);
-  audit.record("SESSION_TERMINATED", session.sessionId, "INFO", { reason: "normal closure" }, "alice");
-  console.log("Session established | Message encrypted/decrypted | Session terminated");
+  const encrypted = channel.encrypt(session.sessionId, "PTH Meridian - Ask. Solve. Done.");
+  const decrypted = channel.decrypt(encrypted);
+  audit.record("MESSAGE_ENCRYPTED", session.sessionId, "INFO", { sequence: encrypted.sequence }, "alice");
+  console.log("Session: " + session.sessionId + " | Message match: " + (decrypted === "PTH Meridian - Ask. Solve. Done."));
   console.log("=== Phase 4 Complete ===\n");
 
-  // PHASE 5 - AUDIT ENGINE
-  console.log("=== Phase 5 - Audit Engine (HMIT Protocol) ===\n");
+  // PHASE 5
+  console.log("=== Phase 5 - Audit Engine ===");
+  audit.record("AUTH_FAILURE", "vault", "WARN", { reason: "bad password" }, "attacker");
+  audit.record("AUTH_FAILURE", "vault", "WARN", { reason: "bad password" }, "attacker");
+  audit.record("AUTH_FAILURE", "vault", "CRITICAL", { reason: "bad password", count: 3 }, "attacker");
+  const integrityCheck = audit.verifyIntegrity();
+  console.log("Chain integrity: " + integrityCheck.valid + " (" + integrityCheck.totalChecked + " entries)");
+  const hmitAlerts = audit.getHMITAlerts("open");
+  console.log("HMIT alerts:     " + hmitAlerts.length + " open");
+  if (hmitAlerts.length > 0) {
+    audit.acknowledgeHMIT(hmitAlerts[0].alertId);
+    audit.resolveHMIT(hmitAlerts[0].alertId);
+  }
+  console.log("=== Phase 5 Complete ===\n");
 
-  // Test 1 - Log integrity verification
-  console.log("Test 1: Tamper-evident log integrity");
-  const integrity = audit.verifyIntegrity();
-  console.log("  Chain Valid:     " + integrity.valid);
-  console.log("  Entries Checked: " + integrity.totalChecked);
+  // PHASE 6 - IDENTITY WALLET
+  console.log("=== Phase 6 - Identity Wallet ===\n");
 
-  // Test 2 - Simulate auth failures to trigger HMIT
-  console.log("\nTest 2: Simulate repeated auth failures — HMIT trigger");
-  audit.record("AUTH_FAILURE", "vault-login", "WARN", { reason: "invalid password" }, "unknown-actor");
-  audit.record("AUTH_FAILURE", "vault-login", "WARN", { reason: "invalid password" }, "unknown-actor");
-  audit.record("AUTH_FAILURE", "vault-login", "CRITICAL", { reason: "invalid password", count: 3 }, "unknown-actor");
-  const openAlerts = audit.getHMITAlerts("open");
-  console.log("  HMIT Alerts Triggered: " + openAlerts.length);
-  openAlerts.forEach((alert) => {
-    console.log("  Alert ID:      " + alert.alertId);
-    console.log("  Severity:      " + alert.severity);
-    console.log("  Reason:        " + alert.reason);
-    console.log("  Recommended:   " + alert.recommended);
-    console.log("  Status:        " + alert.status);
+  const wallet = new IdentityWallet();
+
+  // Test 1 - Create wallet
+  console.log("Test 1: Create identity wallet");
+  const identity = wallet.create(
+    "Alice Chen",
+    sigStore.id,
+    encStore.id,
+    {
+      email: "alice@pth-meridian.io",
+      organization: "PTH Meridian",
+      certId: aliceCert.id,
+    }
+  );
+  audit.record("AUTH_SUCCESS", identity.did, "INFO", { action: "wallet_created" }, "alice");
+  console.log("  DID:           " + identity.did);
+  console.log("  Display Name:  " + identity.displayName);
+  console.log("  Email:         " + identity.email);
+  console.log("  Organization:  " + identity.organization);
+  console.log("  Signing Key:   " + identity.signingKeyId);
+  console.log("  Cert ID:       " + identity.certId);
+  console.log("  Created:       " + new Date(identity.createdAt).toISOString());
+
+  // Test 2 - Export DID document
+  console.log("\nTest 2: DID document");
+  const didDoc = wallet.exportDID() as Record<string, unknown>;
+  console.log("  DID Document:");
+  Object.entries(didDoc).forEach(([k, v]) => {
+    if (Array.isArray(v)) {
+      console.log("  " + k + ": [" + v.length + " entries]");
+    } else if (typeof v === "object" && v !== null) {
+      console.log("  " + k + ": " + JSON.stringify(v).substring(0, 60));
+    } else {
+      console.log("  " + k + ": " + v);
+    }
   });
 
-  // Test 3 - Acknowledge and resolve HMIT alert
-  console.log("\nTest 3: HMIT alert lifecycle");
-  if (openAlerts.length > 0) {
-    audit.acknowledgeHMIT(openAlerts[0].alertId);
-    console.log("  Acknowledged:  " + openAlerts[0].alertId);
-    audit.resolveHMIT(openAlerts[0].alertId);
-    console.log("  Resolved:      " + openAlerts[0].alertId);
-    console.log("  Status:        " + audit.getHMITAlerts()[0].status);
+  // Test 3 - Add verifiable credentials
+  console.log("\nTest 3: Add verifiable credentials");
+  const empCred = wallet.addCredential(
+    ["VerifiableCredential", "EmploymentCredential"],
+    "PTH Meridian HR",
+    {
+      employeeId: "PTH-2026-001",
+      role: "Cryptographic Engineer",
+      department: "SA AT Cryptographics",
+      startDate: "2026-01-01",
+      clearanceLevel: "TOP",
+    },
+    365
+  );
+  audit.record("AUTH_SUCCESS", empCred.id, "INFO", { type: "credential_added" }, "alice");
+  console.log("  Employment Credential: " + empCred.id);
+  console.log("  Type:    " + empCred.type.join(", "));
+  console.log("  Issuer:  " + empCred.issuer);
+  console.log("  Claims:  " + Object.keys(empCred.claims).join(", "));
+  console.log("  Algorithm: " + empCred.algorithm);
+
+  const accessCred = wallet.addCredential(
+    ["VerifiableCredential", "SystemAccessCredential"],
+    "PTH Meridian IT",
+    {
+      systems: ["AKR-KeyGen", "AKR-Naos", "AMuN"],
+      accessLevel: "ADMIN",
+      mfaEnabled: true,
+    },
+    180
+  );
+  console.log("  System Access Credential: " + accessCred.id);
+
+  const idCred = wallet.addCredential(
+    ["VerifiableCredential", "IdentityCredential"],
+    "PTH Meridian Root CA",
+    {
+      legalName: "Alice Chen",
+      email: "alice@pth-meridian.io",
+      country: "CA",
+      verified: true,
+    },
+    730
+  );
+  console.log("  Identity Credential: " + idCred.id);
+
+  // Test 4 - Document signing
+  console.log("\nTest 4: Document signing");
+  const documents = [
+    { name: "Q1 Security Report", content: "PTH Meridian Q1 2026 Security Assessment. All systems operational. No breaches detected. AKR Naos deployed successfully." },
+    { name: "Key Rotation Policy", content: "All cryptographic keys must be rotated every 90 days. ML-KEM-768 and ML-DSA-65 are the approved algorithms." },
+    { name: "NDA Agreement", content: "This non-disclosure agreement binds Alice Chen to maintain confidentiality of PTH Meridian cryptographic infrastructure." },
+  ];
+
+  const signedDocs = [];
+  for (const doc of documents) {
+    const signed = wallet.signDocument(doc.content, doc.name);
+    audit.record("AUTH_SUCCESS", signed.documentId, "INFO", { document: doc.name, hash: signed.documentHash.substring(0, 16) }, "alice");
+    signedDocs.push({ doc, signed });
+    console.log("  [SIGNED] " + doc.name);
+    console.log("    Doc ID:    " + signed.documentId);
+    console.log("    Hash:      " + signed.documentHash.substring(0, 32) + "...");
+    console.log("    Algorithm: " + signed.algorithm);
   }
 
-  // Test 4 - Query audit log
-  console.log("\nTest 4: Audit log queries");
-  const certEvents = audit.query({ type: "CERT_ISSUED" });
-  console.log("  CERT_ISSUED events:  " + certEvents.length);
-  const alertEvents = audit.query({ severity: "ALERT" });
-  console.log("  ALERT severity:      " + alertEvents.length);
-  const aliceEvents = audit.query({ actor: "alice" });
-  console.log("  Alice events:        " + aliceEvents.length);
-  const hmitEvents = audit.query({ hmitOnly: true });
-  console.log("  HMIT flagged:        " + hmitEvents.length);
+  // Test 5 - Document verification
+  console.log("\nTest 5: Document verification");
+  for (const { doc, signed } of signedDocs) {
+    const valid = wallet.verifyDocument(doc.content, signed.documentId);
+    const tampered = wallet.verifyDocument(doc.content + " TAMPERED", signed.documentId);
+    console.log("  " + doc.name + ":");
+    console.log("    Original valid:  " + valid);
+    console.log("    Tampered valid:  " + tampered);
+  }
 
-  // Test 5 - Tamper simulation
-  console.log("\nTest 5: Tamper detection");
-  const preIntegrity = audit.verifyIntegrity();
-  console.log("  Before tamper:   " + (preIntegrity.valid ? "VALID" : "INVALID"));
+  // Test 6 - Verifiable presentation
+  console.log("\nTest 6: Selective disclosure presentation");
+  const request: import("./phase6-wallet/index").PresentationRequest = {
+    requestId: "REQ-" + Date.now(),
+    requester: "api.akr-naos.io",
+    requestedClaims: ["role", "accessLevel", "mfaEnabled", "verified"],
+    purpose: "System access authorization",
+    timestamp: Date.now(),
+  };
+  console.log("  Requester:       " + request.requester);
+  console.log("  Purpose:         " + request.purpose);
+  console.log("  Requested:       " + request.requestedClaims.join(", "));
 
-  // Test 6 - Full audit report
-  console.log("\nTest 6: Full audit report");
-  const report = audit.generateReport();
-  console.log("  Generated At:    " + report.generatedAt);
-  console.log("  Total Events:    " + report.totalEvents);
-  console.log("  Integrity Valid: " + report.integrityValid);
-  console.log("  HMIT Alerts:     " + report.hmitAlerts.length);
-  console.log("  Time Range:      " + report.timeRange.from + " to " + report.timeRange.to);
-  console.log("  Event Breakdown:");
-  Object.entries(report.breakdown).forEach(([type, count]) => {
-    console.log("    " + type + ": " + count);
+  const presentation = wallet.createPresentation(
+    request,
+    [empCred.id, accessCred.id, idCred.id]
+  );
+  console.log("  Presentation ID: " + presentation.presentationId);
+  console.log("  Holder DID:      " + presentation.holderDid);
+  console.log("  Disclosed:");
+  Object.entries(presentation.disclosedClaims).forEach(([k, v]) => {
+    console.log("    " + k + ": " + v);
   });
-  console.log("  Top Actors:");
-  report.topActors.forEach((a) => {
-    console.log("    " + a.actor + ": " + a.count + " events");
+  console.log("  Note: Other claims NOT disclosed (selective disclosure)");
+
+  // Test 7 - Credential revocation
+  console.log("\nTest 7: Credential revocation");
+  wallet.revokeCredential(accessCred.id);
+  audit.record("KEY_REVOKED", accessCred.id, "ALERT", { reason: "access terminated" }, "alice");
+  const creds = wallet.getCredentials();
+  creds.forEach((c) => {
+    console.log("  [" + c.status.toUpperCase() + "] " + c.type[1] + " — " + c.id);
   });
 
-  // Test 7 - Audit stats
-  console.log("\nTest 7: Audit statistics");
-  const stats = audit.getStats() as Record<string, unknown>;
+  // Test 8 - Wallet stats
+  console.log("\nTest 8: Wallet statistics");
+  const stats = wallet.getStats();
   Object.entries(stats).forEach(([k, v]) => {
     console.log("  " + k + ": " + v);
   });
 
-  audit.record("SYSTEM_STOP", "AKR-NAOS", "INFO", { reason: "normal shutdown" }, "SYSTEM");
+  // Final audit report
+  console.log("\n=== Final System Audit Report ===");
+  audit.record("SYSTEM_STOP", "AKR-NAOS", "INFO", { reason: "normal shutdown", phasesComplete: 6 }, "SYSTEM");
+  const finalReport = audit.generateReport();
+  console.log("  Total Events:    " + finalReport.totalEvents);
+  console.log("  Integrity:       " + finalReport.integrityValid);
+  console.log("  HMIT Alerts:     " + finalReport.hmitAlerts.length);
+  console.log("  Event Breakdown:");
+  Object.entries(finalReport.breakdown).forEach(([type, count]) => {
+    console.log("    " + type + ": " + count);
+  });
+  console.log("  Top Actors:");
+  finalReport.topActors.forEach((a) => {
+    console.log("    " + a.actor + ": " + a.count + " events");
+  });
 
-  console.log("\n=== Phase 5 Complete ===");
-  console.log("Audit Engine operational.");
-  console.log("Tamper-evident chain. HMIT Protocol. Alert lifecycle. Query engine. Full report. All working.");
+  console.log("\n" + "=".repeat(60));
+  console.log("=== ALL 6 PHASES COMPLETE ===");
+  console.log("=".repeat(60));
+  console.log("");
+  console.log("AKR Naos - Nested Authentication Operations Suite");
+  console.log("SA AT Cryptographics - PTH Meridian");
+  console.log("");
+  console.log("Phase 1  Shamir Secret Sharing     OPERATIONAL");
+  console.log("Phase 2  Key Vault                 OPERATIONAL");
+  console.log("Phase 3  Certificate Authority     OPERATIONAL");
+  console.log("Phase 4  Secure Channel            OPERATIONAL");
+  console.log("Phase 5  Audit Engine + HMIT       OPERATIONAL");
+  console.log("Phase 6  Identity Wallet           OPERATIONAL");
+  console.log("");
+  console.log("The foundation is built.");
+  console.log("The palace can now be constructed.");
 }
 
 main().catch(console.error);
