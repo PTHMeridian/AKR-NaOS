@@ -15,7 +15,9 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "secrets.js-grempe": "^2.0.3"
+    "@peculiar/asn1-schema": "^2.6.0",
+    "@peculiar/x509": "^2.0.0",
+    "secrets.js-grempe": "2.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
