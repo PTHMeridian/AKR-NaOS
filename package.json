@@ -17,6 +17,7 @@
   "dependencies": {
     "@peculiar/asn1-schema": "^2.6.0",
     "@peculiar/x509": "^2.0.0",
+    "argon2": "^0.44.0",
     "secrets.js-grempe": "2.0.0"
   },
   "devDependencies": {

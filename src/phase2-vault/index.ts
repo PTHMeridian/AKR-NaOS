@@ -1,4 +1,5 @@
-import { randomBytes, createHash, timingSafeEqual } from "crypto";
+import { randomBytes, createHash, createHmac } from "crypto";
+import { KDFModule } from "./kdf";
 import { ShamirModule } from "../phase1-shamir/index";
 import type { ShamirConfig } from "../types/index";
 
@@ -9,7 +10,9 @@ export interface VaultEntry {
   mode: string;
   encryptedKey: string;
   iv: string;
-  salt: string;
+  mac: string;
+  kdfSalt: string;
+  kdfConfig: string;
   publicKey?: string;
   createdAt: number;
   expiresAt?: number;
@@ -25,6 +28,7 @@ export interface VaultStoreResult {
   status: string;
   createdAt: string;
   expiresAt?: string;
+  kdfAlgorithm: string;
   shamirShares?: string[];
 }
 
@@ -48,60 +52,35 @@ export interface VaultRotateResult {
 export class VaultModule {
   private vault: Map<string, VaultEntry> = new Map();
   private shamir: ShamirModule = new ShamirModule();
+  private kdf: KDFModule = new KDFModule();
 
   private generateId(): string {
     return "VLT-" + Date.now() + "-" + randomBytes(4).toString("hex").toUpperCase();
   }
 
-  private deriveKey(password: string, salt: Buffer): Buffer {
-    let key = Buffer.concat([Buffer.from(password), salt]);
-    for (let i = 0; i < 100000; i++) {
-      key = createHash("sha256").update(key).digest();
-    }
-    return key;
-  }
-
-  private encrypt(data: string, password: string): { encrypted: string; iv: string; salt: string } {
-    const salt = randomBytes(32);
-    const key = this.deriveKey(password, salt);
-    const iv = randomBytes(12);
-    const dataBuffer = Buffer.from(data, "utf8");
-    const encrypted = Buffer.alloc(dataBuffer.length);
-    
-    let keyStream = createHash("sha256").update(Buffer.concat([key, iv])).digest();
-    for (let i = 0; i < dataBuffer.length; i++) {
-      if (i % 32 === 0 && i > 0) {
-        keyStream = createHash("sha256").update(Buffer.concat([keyStream, Buffer.from([i])])).digest();
+  private xorEncrypt(data: Buffer, key: Buffer, iv: Buffer): Buffer {
+    let keyStream = createHash("sha256")
+      .update(Buffer.concat([key, iv]))
+      .digest();
+    const result = Buffer.alloc(data.length);
+    for (let i = 0; i < data.length; i++) {
+      if (i > 0 && i % 32 === 0) {
+        keyStream = createHash("sha256")
+          .update(Buffer.concat([keyStream, Buffer.from([i >> 8]), Buffer.from([i & 0xff])]))
+          .digest();
       }
-      encrypted[i] = dataBuffer[i] ^ keyStream[i % 32];
+      result[i] = data[i] ^ keyStream[i % 32];
     }
-
-    return {
-      encrypted: encrypted.toString("hex"),
-      iv: iv.toString("hex"),
-      salt: salt.toString("hex"),
-    };
+    return result;
   }
 
-  private decrypt(encryptedHex: string, password: string, ivHex: string, saltHex: string): string {
-    const salt = Buffer.from(saltHex, "hex");
-    const key = this.deriveKey(password, salt);
-    const iv = Buffer.from(ivHex, "hex");
-    const encrypted = Buffer.from(encryptedHex, "hex");
-    const decrypted = Buffer.alloc(encrypted.length);
-
-    let keyStream = createHash("sha256").update(Buffer.concat([key, iv])).digest();
-    for (let i = 0; i < encrypted.length; i++) {
-      if (i % 32 === 0 && i > 0) {
-        keyStream = createHash("sha256").update(Buffer.concat([keyStream, Buffer.from([i])])).digest();
-      }
-      decrypted[i] = encrypted[i] ^ keyStream[i % 32];
-    }
-
-    return decrypted.toString("utf8");
+  private computeMAC(encryptedKey: Buffer, iv: Buffer, id: string, macKey: Buffer): string {
+    return createHmac("sha256", macKey)
+      .update(Buffer.concat([encryptedKey, iv, Buffer.from(id)]))
+      .digest("hex");
   }
 
-  store(
+  async store(
     privateKey: Uint8Array,
     password: string,
     options: {
@@ -112,20 +91,33 @@ export class VaultModule {
       expiryDays?: number;
       metadata?: Record<string, string>;
       shamirConfig?: ShamirConfig;
+      sensitive?: boolean;
     }
-  ): VaultStoreResult {
+  ): Promise<VaultStoreResult> {
     const id = this.generateId();
-    const keyHex = Buffer.from(privateKey).toString("hex");
-    const { encrypted, iv, salt } = this.encrypt(keyHex, password);
+
+    const derived = options.sensitive
+      ? await this.kdf.deriveKeyForSensitive(password)
+      : await this.kdf.deriveKeyForVault(password);
+
+    const encKey = derived.key.slice(0, 16);
+    const macKey = derived.key.slice(16, 32);
+
+    const iv = randomBytes(16);
+    const keyData = Buffer.from(privateKey);
+    const encrypted = this.xorEncrypt(keyData, encKey, iv);
+    const mac = this.computeMAC(encrypted, iv, id, macKey);
 
     const entry: VaultEntry = {
       id,
       label: options.label,
       algorithm: options.algorithm,
       mode: options.mode,
-      encryptedKey: encrypted,
-      iv,
-      salt,
+      encryptedKey: encrypted.toString("hex"),
+      iv: iv.toString("hex"),
+      mac,
+      kdfSalt: derived.salt.toString("hex"),
+      kdfConfig: this.kdf.serializeConfig(derived),
       publicKey: options.publicKey
         ? Buffer.from(options.publicKey).toString("hex")
         : undefined,
@@ -147,9 +139,11 @@ export class VaultModule {
       expiresAt: entry.expiresAt
         ? new Date(entry.expiresAt).toISOString()
         : undefined,
+      kdfAlgorithm: "Argon2id",
     };
 
     if (options.shamirConfig) {
+      const keyHex = Buffer.from(privateKey).toString("hex");
       const splitResult = this.shamir.split(keyHex, options.shamirConfig);
       result.shamirShares = splitResult.shares.map((s) => s.share.substring(0, 16) + "...");
       entry.metadata["shamirHash"] = splitResult.secretHash;
@@ -160,53 +154,60 @@ export class VaultModule {
     return result;
   }
 
-  retrieve(id: string, password: string): VaultRetrieveResult {
+  async retrieve(id: string, password: string): Promise<VaultRetrieveResult> {
     const entry = this.vault.get(id);
-    if (!entry) throw new Error(`Key not found: ${id}`);
-    if (entry.status === "revoked") throw new Error(`Key has been revoked: ${id}`);
-
+    if (!entry) throw new Error("Key not found: " + id);
+    if (entry.status === "revoked") throw new Error("Key has been revoked: " + id);
     if (entry.expiresAt && Date.now() > entry.expiresAt) {
       entry.status = "expired";
-      throw new Error(`Key has expired: ${id}`);
+      throw new Error("Key has expired: " + id);
     }
 
-    const keyHex = this.decrypt(entry.encryptedKey, password, entry.iv, entry.salt);
-    const privateKey = new Uint8Array(Buffer.from(keyHex, "hex"));
+    const { salt, config } = this.kdf.deserializeConfig(entry.kdfConfig);
+    const derived = await this.kdf.deriveKey(password, salt, config);
+
+    const encKey = derived.key.slice(0, 16);
+    const macKey = derived.key.slice(16, 32);
+
+    const iv = Buffer.from(entry.iv, "hex");
+    const encrypted = Buffer.from(entry.encryptedKey, "hex");
+
+    const expectedMAC = this.computeMAC(encrypted, iv, id, macKey);
+    if (expectedMAC !== entry.mac) {
+      throw new Error("Authentication failed — invalid password or corrupted vault entry");
+    }
+
+    const decrypted = this.xorEncrypt(encrypted, encKey, iv);
 
     return {
       id: entry.id,
       label: entry.label,
-      privateKey,
+      privateKey: new Uint8Array(decrypted),
       algorithm: entry.algorithm,
       mode: entry.mode,
       status: entry.status,
     };
   }
 
-  rotate(
+  async rotate(
     id: string,
     oldPassword: string,
     newPrivateKey: Uint8Array,
     newPassword: string
-  ): VaultRotateResult {
+  ): Promise<VaultRotateResult> {
     const oldEntry = this.vault.get(id);
-    if (!oldEntry) throw new Error(`Key not found: ${id}`);
-    if (oldEntry.status === "revoked") throw new Error(`Cannot rotate revoked key: ${id}`);
+    if (!oldEntry) throw new Error("Key not found: " + id);
+    if (oldEntry.status === "revoked") throw new Error("Cannot rotate revoked key: " + id);
 
-    this.retrieve(id, oldPassword);
-
+    await this.retrieve(id, oldPassword);
     oldEntry.status = "rotated";
     oldEntry.rotatedAt = Date.now();
 
-    const newResult = this.store(newPrivateKey, newPassword, {
+    const newResult = await this.store(newPrivateKey, newPassword, {
       label: oldEntry.label + "-rotated",
       algorithm: oldEntry.algorithm,
       mode: oldEntry.mode,
-      metadata: {
-        ...oldEntry.metadata,
-        previousId: id,
-        rotatedFrom: id,
-      },
+      metadata: { ...oldEntry.metadata, previousId: id },
     });
 
     return {
@@ -218,44 +219,33 @@ export class VaultModule {
     };
   }
 
-  revoke(id: string, password: string, reason?: string): void {
+  async revoke(id: string, password: string, reason?: string): Promise<void> {
     const entry = this.vault.get(id);
-    if (!entry) throw new Error(`Key not found: ${id}`);
-
-    this.retrieve(id, password);
-
+    if (!entry) throw new Error("Key not found: " + id);
+    await this.retrieve(id, password);
     entry.status = "revoked";
     entry.revokedAt = Date.now();
     entry.metadata["revokeReason"] = reason || "manually revoked";
   }
 
-  list(): Omit<VaultEntry, "encryptedKey" | "iv" | "salt">[] {
-    return Array.from(this.vault.values()).map(({ encryptedKey, iv, salt, ...safe }) => safe);
+  list(): Omit<VaultEntry, "encryptedKey" | "iv" | "mac" | "kdfSalt" | "kdfConfig">[] {
+    return Array.from(this.vault.values()).map(
+      ({ encryptedKey, iv, mac, kdfSalt, kdfConfig, ...safe }) => safe
+    );
   }
 
   getStatus(id: string): string {
     const entry = this.vault.get(id);
-    if (!entry) throw new Error(`Key not found: ${id}`);
+    if (!entry) throw new Error("Key not found: " + id);
     if (entry.expiresAt && Date.now() > entry.expiresAt) return "expired";
     return entry.status;
   }
 
-  getExpiring(withinDays: number): Omit<VaultEntry, "encryptedKey" | "iv" | "salt">[] {
+  getExpiring(withinDays: number): Omit<VaultEntry, "encryptedKey" | "iv" | "mac" | "kdfSalt" | "kdfConfig">[] {
     const cutoff = Date.now() + withinDays * 24 * 60 * 60 * 1000;
     return this.list().filter(
       (e) => e.expiresAt && e.expiresAt <= cutoff && e.status === "active"
     );
-  }
-
-  purgeRevoked(): number {
-    let count = 0;
-    this.vault.forEach((entry, id) => {
-      if (entry.status === "revoked") {
-        this.vault.delete(id);
-        count++;
-      }
-    });
-    return count;
   }
 
   stats(): object {
@@ -266,6 +256,7 @@ export class VaultModule {
       rotated: entries.filter((e) => e.status === "rotated").length,
       revoked: entries.filter((e) => e.status === "revoked").length,
       expired: entries.filter((e) => e.status === "expired").length,
+      kdfAlgorithm: "Argon2id",
       algorithms: [...new Set(entries.map((e) => e.algorithm))],
       modes: [...new Set(entries.map((e) => e.mode))],
     };
