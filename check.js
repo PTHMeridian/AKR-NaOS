@@ -1,0 +1,1 @@
+const fs = require("fs"); const content = fs.readFileSync("src/phase6-wallet/attestation.ts", "utf8"); console.log("attestation module:", content.length, "bytes");
